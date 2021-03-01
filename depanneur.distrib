@@ -193,8 +193,9 @@ my $reverse_off = 0; #disable reverse dependency
 my $reverse_on = 1; #enable reverse dependency
 my $export_only = 0; # only export, not building
 my $tarfile = 0; # generate tar file for dependence & reverse dependence xml file
+
 # Feature : Distrb build
-my $distrb_build = 0; #disable distrb build
+my $distrb_build = 1; #disable distrb build
 my $distrb_threads = 2; # Distrb max threads depanneur creates
 my $distrb_pkgs = ""; # Distrb priority packages.
 my $distrb_localaddr      = ""; # Local IP address
@@ -202,6 +203,7 @@ my $distrb_hostaddr = ""; # Distrb IP Address
 my $distrb_hostuname = ""; # SSH username
 my $distrb_hostkey = ""; # SSH Identity File
 my $clean_from_pkg = "chromium-efl";
+
 GetOptions (
     "repository=s" => \@repos,
     "arch=s" => \$arch,
@@ -514,15 +516,28 @@ sub distrb_safe_umount {
 # Initial a distrbute system
 #---------------------------------------------------------------------
 sub my_distrb_init {
-   debug("my_distrb_init");
+   debug("******** my_distrb_init");
+   $distrb_build = 1;
+   $distrb_threads = int($MAX_THREADS/2);
+   $distrb_pkgs = "";
+   $distrb_localaddr = "192.168.219.168";
+   $distrb_hostaddr = "192.168.219.168";
+   $distrb_hostuname = "hyokeun";
+   $distrb_hostkey = "/home/hyokeun/.ssh/id_rsa";
+   $clean_from_pkg = "chromium-efl";
+
+   my $pd = basename(dirname(dirname($build_root)));
+   my $bf = basename($build_root);
+   my $build_root_secondary = $pd . "/build-secondary/" . $bf;
+
    # umount sshfs to remote host
-   my_distrb_sshfs_umount("$build_root/local/sources");
+   my_distrb_sshfs_umount("$build_root_secondary/local/sources");
    my_cp_distrb("$dist_configs/$dist.conf");
    # sshfs mount to remote host
-   my_distrb_system("sudo rm -rf $build_root");
-   my_distrb_system("sudo mkdir -p $build_root");
-   my_distrb_system("sudo mkdir -p $build_root/local/BUILD-ROOTS");
-   my_distrb_sshfs_mount("$build_root/local/sources");
+   my_distrb_system("sudo rm -rf $build_root_secondary");
+   my_distrb_system("sudo mkdir -p $build_root_secondary");
+   my_distrb_system("sudo mkdir -p $build_root_secondary/local/BUILD-ROOTS");
+   my_distrb_sshfs_mount("$build_root_secondary/local/sources");
    my_system_sync_to_distrb("$localrepo/");
 }
 
@@ -546,8 +561,9 @@ sub my_distrb_system {
     my $ret;
     my $pid;
     my @out = ();
-    my $ssh_remote = "ssh -o loglevel=ERROR -i $distrb_hostkey $distrb_hostuname" . "@" . "$distrb_hostaddr";
+    my $ssh_remote = "ssh -o StrictHostKeyChecking=no -o loglevel=ERROR -i $distrb_hostkey $distrb_hostuname" . "@" . "$distrb_hostaddr";
     $cmd = $ssh_remote . " " . '"' . $cmd .'"';
+    debug($cmd);
     if (wantarray) {
         defined($pid=open(PIPE, "-|")) or die "Can not fork: $!\n";
     } else {
@@ -3365,7 +3381,7 @@ if (@bins) {
 }
 
 #alway generate depends and reverse depends xml file.
-generate_depends_xmlfile();
+#generate_depends_xmlfile();
 
 warning("no available packages to build.") if (scalar (keys %to_build) == 0);
 
@@ -3466,8 +3482,12 @@ if ($debug) {
         print "\n";
     }
 }
+
 # if distrb build
-my_distrb_init() if ($distrb_build);
+if ($distrb_build == 1) {
+    debug("****** initialiizing distributed build");
+    my_distrb_init() ;
+}
 
 # Main process loop
 # Every loop, first update package information
@@ -3587,54 +3607,61 @@ while (! $TERM) {
         }
 
         for (; $needed && ! $TERM; $needed--) {
-
-	    	my $job ;
+	    	my $job;
 	    	if (scalar (@order) != 0) {
 				$job = shift(@order);
 	    	}
 	    	else {
-				last ;
+				last;
 	    	}
 
-	    my $worker;
+	        my $worker;
 
-	    # if distrbute build 
-            if ($distrb_build) {
-	       my @pkgs_list = split(",", $distrb_pkgs);
-	       my $find = 0;
-               if( grep($_ eq $job, @chromium_efl_build_order) ) {
+	        # if distrbute build 
+            if ($distrb_build == 0) {
+                $worker = find_idle();
+            } else {
+                my @pkgs_list = split(",", $distrb_pkgs);
+                my $find = 0;
+
+=begin comment
+                if( grep($_ eq $job, @chromium_efl_build_order) ) {
                     $find = 0;
-               } else {
-                 foreach my $name (@chromium_efl_build_order) {
-                   if( ! (grep $_ eq $name, @done) )
-                   {
-                     $find = 1;
-                     last;  
-                   }
-		   $find = 0;
-                 }
-               }
-	       if ( grep($_ eq $job, @pkgs_list) || grep($_ eq $job, @zero_links) ) {
-                   $find = 1;
-	       }
+                } else {
+                    foreach my $name (@chromium_efl_build_order) {
+                        if( ! (grep $_ eq $name, @done) ) {
+                            $find = 1;
+                            last;  
+                        }
+                        $find = 0;
+                    }
+                }
 
-               if ($find == 1) {
-                  $worker = find_idle_next(int(int($MAX_THREADS)-int($distrb_threads)));
-		  if ($worker == -1) {
-		      next;
-	          }
-               } else {
-                  $worker = find_idle();
-               }
-	       # print "clean: $clean_from_pkg , $job \n";
-	       if ($clean_from_pkg eq $job) {
-		  print "cleaned\n";
-                  @cleaned = ();
-		  @zero_links = ();
-	       }
-	    } else {
-	       $worker = find_idle();
+                if ( grep($_ eq $job, @pkgs_list) || grep($_ eq $job, @zero_links) ) {
+                    $find = 1;
+                }
+=end comment
+=cut
+
+                if ($find == 1) {
+                    $worker = find_idle_next(int(int($MAX_THREADS)-int($distrb_threads)));
+                    if ($worker == -1) {
+                        next;
+                    }
+                } else {
+                    $worker = find_idle();
+                }
+                # print "clean: $clean_from_pkg , $job \n";
+                if ($clean_from_pkg eq $job) {
+                    print "cleaned\n";
+                    @cleaned = ();
+=begin comment
+                    @zero_links = ();
+=end comment
+=cut
+                }
             }
+
             my $index;
             {
                 # @done and @running are thread shared vars
