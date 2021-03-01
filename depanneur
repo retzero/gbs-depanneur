@@ -196,6 +196,16 @@ my $export_only = 0; # only export, not building
 my $tarfile = 0; # generate tar file for dependence & reverse dependence xml file
 my $preordered_list = ""; # List of ordered packages to support user defined build order calculation
 
+# Feature : Distrb build
+my $distrb_build = 0; #disable distrb build
+my $distrb_threads = 2; # Distrb max threads depanneur creates
+my $distrb_pkgs = ""; # Distrb priority packages.
+my $distrb_localaddr      = ""; # Local IP address
+my $distrb_hostaddr = ""; # Distrb IP Address
+my $distrb_hostuname = ""; # SSH username
+my $distrb_hostkey = ""; # SSH Identity File
+my $clean_from_pkg = "chromium-efl";
+
 GetOptions (
     "repository=s" => \@repos,
     "arch=s" => \$arch,
@@ -255,6 +265,13 @@ GetOptions (
     "export-only" => \$export_only,
     "tarfile" => \$tarfile,
     "preordered-list=s" => \$preordered_list,
+    "distrb-build=s" => \$distrb_build,
+    "distrb-threads=s" => \$distrb_threads,
+    "distrb-pkgs=s" => \$distrb_pkgs,
+    "distrb-localaddr=s" => \$distrb_localaddr,
+    "distrb-hostaddr=s" => \$distrb_hostaddr,
+    "distrb-hostuname=s" => \$distrb_hostuname,
+    "distrb-hostkey=s" => \$distrb_hostkey,
     );
 
 if ( $help ) {
@@ -377,6 +394,166 @@ sub my_system {
     my $ret;
     my $pid;
     my @out = ();
+    if (wantarray) {
+        defined($pid=open(PIPE, "-|")) or die "Can not fork: $!\n";
+    } else {
+        defined($pid=fork) or die "Can not fork: $!\n";
+    }
+
+    unless ($pid) {  # Child
+        open(STDERR, ">&STDOUT");
+        exec ($cmd);
+        exit -1;
+    } else {  # Parent
+        if (wantarray) {
+            while (my $line = <PIPE>) {
+                print $line;
+                push @out, $line;
+            }
+        }
+        waitpid ($pid,0);
+        $ret = $?;
+        close(PIPE) if wantarray;
+
+        return wantarray ? ($ret, @out): $ret;
+    }
+}
+
+#---------------------------------------------------------------------
+# Feature : Distrb build 
+# copy file to distrbute system
+#---------------------------------------------------------------------
+sub my_cp_distrb {
+   my $file = shift;
+
+   my $dir = dirname($file);
+   my $pre_cmd = "sudo mkdir -p $dir";
+   debug("my_cp_distrb");
+   my_distrb_system($pre_cmd);
+   my $cmd = "sudo rsync -aHrlXS --numeric-ids -e 'ssh -o loglevel=ERROR -i $distrb_hostkey' --rsync-path='sudo rsync' --delete --quiet "
+             . $file . " " . $distrb_hostuname . "@" . $distrb_hostaddr . ":" . $file;
+   my_system($cmd);
+}
+
+#---------------------------------------------------------------------
+# Feature : Distrb build 
+# sync directory from my system to distrbute system
+#---------------------------------------------------------------------
+sub my_system_sync_to_distrb {
+   my $file = shift;
+
+   my $dir = dirname($file);
+   # my $pre_cmd = "sudo mkdir -p $dir";
+   debug("my_system_sync_to_distrb");
+   # my_distrb_system($pre_cmd);
+   my $cmd = "sudo rsync -aHrlXS --numeric-ids -e 'ssh -o loglevel=ERROR -i $distrb_hostkey' --rsync-path='sudo rsync' --delete --quiet "
+	     . $file . " " . $distrb_hostuname . "@" . $distrb_hostaddr . ":" . $file;
+   my_system($cmd);
+}
+
+#---------------------------------------------------------------------
+# Feature : Distrb build 
+# sync directory from distrbute system to my system
+#---------------------------------------------------------------------
+sub my_distrb_sync_to_system {
+   my $path = shift;
+   my $include = shift;
+
+   my $dir = dirname($path);
+   my $base = basename($path);
+   my $pre_cmd = "sudo mkdir -p $dir";
+   debug("my_distrb_sync_to_system");
+   my_system($pre_cmd);
+   my $cmd = "sudo rsync -aHrlXS --numeric-ids -e 'ssh -o loglevel=ERROR -i $distrb_hostkey' --rsync-path='sudo rsync' --delete --quiet --include '*/' --include='$include' --exclude='*/' "
+             . $distrb_hostuname . "@" . $distrb_hostaddr . ":" . $path . " " . $path;
+   my_system($cmd);
+}
+
+#---------------------------------------------------------------------
+# Feature : Distrb build 
+# mount directory to distrbute system
+#---------------------------------------------------------------------
+sub my_distrb_sshfs_mount {
+   my $dir = shift;
+   my $pre_cmd = "sudo mkdir -p $dir";
+   debug("my_distrb_sshfs_mount");
+   my_distrb_system($pre_cmd);
+   my $sshfs_remote = "sshfs -o IdentityFile=$distrb_hostkey $distrb_hostuname" . "@" . "$distrb_localaddr";
+   my $cmd = "sudo " . $sshfs_remote . ":" . $dir . " " . $dir . " -oallow_other,auto_cache,reconnect";
+   my_distrb_system($cmd);
+}
+
+#---------------------------------------------------------------------
+# Feature : Distrb build 
+# umount directory to distrbute system
+#---------------------------------------------------------------------
+sub my_distrb_sshfs_umount {
+   my $dir = shift;
+   my $cmd =  "sudo umount $dir";
+   debug("my_distrb_sshfs_umount");
+   my_distrb_system($cmd);
+   my $post_cmd = "sudo rmdir $dir";
+   my_distrb_system($post_cmd);
+}
+
+#---------------------------------------------------------------------
+# Feature : Distrb build 
+# safe umount to distrbute system
+#---------------------------------------------------------------------
+sub distrb_safe_umount {
+    my ($device) = @_;
+    return if (my_distrb_system("sudo /bin/umount -l '$device'") == 0);
+
+    warning("!!!! umount device $device failed. It may cause files lost in ".
+        "some cases. Please stop the process which is using this device and ".
+        "press any key to umount again !!!!");
+
+    #my_distrb_system("sudo kill -9 $(ps -aux | grep '/usr/bin/build' | awk '{print $2}')");
+    if (my_distrb_system("sudo /bin/umount -l -f '$device'") != 0) {
+        warning("!!!! IMPORTANT: umount failed again, please backup your ".
+        "source code and try to umount manually !!!!");
+    }
+}
+
+#---------------------------------------------------------------------
+# Feature : Distrb build 
+# Initial a distrbute system
+#---------------------------------------------------------------------
+sub my_distrb_init {
+   debug("my_distrb_init");
+   # umount sshfs to remote host
+   my_distrb_sshfs_umount("$build_root/local/sources");
+   my_cp_distrb("$dist_configs/$dist.conf");
+   # sshfs mount to remote host
+   my_distrb_system("sudo rm -rf $build_root");
+   my_distrb_system("sudo mkdir -p $build_root");
+   my_distrb_system("sudo mkdir -p $build_root/local/BUILD-ROOTS");
+   my_distrb_sshfs_mount("$build_root/local/sources");
+   my_system_sync_to_distrb("$localrepo/");
+}
+
+#---------------------------------------------------------------------
+# Feature : Distrb build 
+# remove a distrbute system
+#---------------------------------------------------------------------
+sub my_distrb_remove {
+   debug("my_distrb_remove");
+   # umount sshfs to remote host
+   my_distrb_sshfs_umount("$build_root/local/sources");
+}
+
+#---------------------------------------------------------------------
+# Feature : Distrb build 
+# command a distrbute system with ssh protocal
+#---------------------------------------------------------------------
+sub my_distrb_system {
+    my $cmd = shift;
+    debug("my_distrb_system: $cmd");
+    my $ret;
+    my $pid;
+    my @out = ();
+    my $ssh_remote = "ssh -o loglevel=ERROR -i $distrb_hostkey $distrb_hostuname" . "@" . "$distrb_hostaddr";
+    $cmd = $ssh_remote . " " . '"' . $cmd .'"';
     if (wantarray) {
         defined($pid=open(PIPE, "-|")) or die "Can not fork: $!\n";
     } else {
@@ -1389,6 +1566,25 @@ sub no_of_idle_thread {
 }
 
 #---------------------------------------------------------------------
+# Feature : Distrb build 
+# find a next idle from value
+#---------------------------------------------------------------------
+sub find_idle_next {
+    my $next = shift;
+    my $idle = -1;
+    set_idle_of_all_finished_thread();
+    # find a idle one to return pool id
+    foreach my $w (sort keys %workers) {
+        if ($w < $next) { next; }
+        if ( $workers{$w}->{state} eq 'idle' ) {
+            $idle = $w;
+            last;
+        }
+    }
+    return $idle;
+}
+
+#---------------------------------------------------------------------
 # set state of its thread in pool busy
 #---------------------------------------------------------------------
 sub set_busy {
@@ -1791,7 +1987,16 @@ sub worker_thread {
     my $status;
     eval {
         # call build process
-        $status = build_package($name, $thread, $index);
+	# if distrb build
+        if ($distrb_build) {
+	   if ( $thread >= int(int($MAX_THREADS)-int($distrb_threads))) {
+              $status = distrb_build_package($name, $thread, $index);
+           } else {
+              $status = build_package($name, $thread, $index);
+	   }
+        } else {
+           $status = build_package($name, $thread, $index);
+	}
     };
     if ($@) {
         warning("$@");
@@ -2033,7 +2238,7 @@ sub build_package {
         error("build root is not ready , --noinit is not allowed");
     }
     push @args, "--clean" if (-e "'$scratch'/not-ready");
-    push @args, $redirect;
+    #push @args, $redirect;
     for my $define (@defines) {
         push @args, "--define '$define'";
     }
@@ -2108,6 +2313,9 @@ sub build_package {
         push @args, "--stage=\"-bb\"" if ($skip_srcrpm == 1);
     }
 
+    #must be push the last time
+    push @args, $redirect;
+
     $cmd = join(" ", @args);
     #debug($cmd);
     my $ret = my_system ($cmd);
@@ -2177,6 +2385,9 @@ sub build_package {
                     my_system ("sudo ln '$_' '$rpm_repo_path'");
                 }
             }
+            my_system("'$build_dir'/createdirdeps '$rpm_repo_path' > '$order_dir'/.repo.cache.local ");
+            my_system("echo D: >> '$order_dir'/.repo.cache.local");
+            my_system("cat '$order_dir'/.repo.cache.local '$order_dir'/.repo.cache.remote >'$order_dir'/.repo.cache");
         }
         info("finished building $name");
         $packages_built = 1;
@@ -2197,6 +2408,320 @@ sub build_package {
         }
         return 1;
     }
+
+}
+
+
+#---------------------------------------------------------------------
+# Feature : Distrb build
+# Generate buid command to distrb system and run it
+#---------------------------------------------------------------------
+sub distrb_build_package {
+    my ($name, $thread, $index) = @_;
+    use vars qw(@package_repos);
+
+    my $version = $to_build{$name}->{version};
+    my $release = $to_build{$name}->{release};
+    my $spec_name = basename($to_build{$name}->{filename});
+    my $pkg_path = "$build_root/local/sources/$dist/$name-$version-$release";
+    my $srpm_filename = "";
+    my $not_ex = 0;
+
+    if ( ( $style eq "git" || $style eq "tar" ) && $incremental == 0 ) {
+        if ($not_export_source == 1) {
+            $not_ex = grep /^$name$/, @not_export;
+            if ($vmtype eq "kvm") {
+               $not_ex = 0;
+            }
+            if ($not_ex) {
+                $srpm_filename = $to_build{$name}->{filename};
+            } else {
+                $srpm_filename = "$pkg_path/$spec_name";
+            }
+        } else {
+            $srpm_filename = "$pkg_path/$spec_name";
+        }
+    } else {
+        $srpm_filename = $to_build{$name}->{filename};
+    }
+
+    my @args = ();
+    my @args_inc = ();
+    if ($TERM == 1) {
+        return -1;
+    }
+    push @args, "sudo /usr/bin/build";
+    push @args, "--uid $zuid:$zgid" if ($zuid != 0 && $zgid != 0);
+    my $nprocessors = 2;
+    if ($^O eq "linux") {
+	# $nprocessors = int(int(sysconf(SC_NPROCESSORS_ONLN))/int($MAX_THREADS));
+        my $current_threads = threads->list();    	
+        $nprocessors = int(int(sysconf(SC_NPROCESSORS_ONLN))/int($current_threads));
+        if ($nprocessors < 1) {
+            $nprocessors = 1;
+        }
+    } else {
+        warning("depanneur only support linux platform");
+    }
+    my $target_arch=`$build_dir/queryconfig target --dist '$dist' --configdir '$dist_configs' --archpath '$arch'`;
+    chomp $target_arch;
+    if ($target_arch eq "") {
+        push @args, "--target $arch";
+    } else {
+        push @args, "--target $target_arch";
+    }
+    push @args, "--jobs " . $nprocessors * 2;
+    push @args, "--no-init" if ($noinit == 1);
+    push @args, "--keep-packs" if ($keep_packs == 1);
+    push @args, "--use-higher-deps" if ($use_higher_deps == 1);
+    push @args, "--cachedir '$cache_dir'";
+    push @args, "--dist '$dist_configs'/$dist.conf";
+    push @args, "--arch '$archpath'";
+    push @args, "'$srpm_filename'";
+    push @args, "--ccache" if ($ccache);
+    push @args, "--icecream '$icecream'" if ($icecream);
+    push @args, "--baselibs" if ($create_baselibs);
+    if (! $extra_packs eq "") {
+        my $packs = join(' ', split(',', $extra_packs));
+        push @args, "--extra-packs=\"$packs\"";
+    }
+
+    # Rebuild the package.
+    my $count = scalar(keys %to_build) - scalar (@skipped);
+    info("*** [$index/$count] building $name-$version-$release $arch $dist (remote worker: $thread) ***");
+
+    if ( -d "$rpm_repo_path" ) {
+        push @args, "--repository '$rpm_repo_path'";
+    }
+    foreach my $r (@package_repos) {
+        push @args, "--repository $r";
+    }
+
+    if ( ($clean || $cleanonce ) && ( ! grep $_ == $thread, @cleaned) ) {
+       push @args, "--clean";
+       if ($cleanonce) {
+            push(@cleaned, $thread);
+       }
+    }
+    my $scratch = "$scratch_dir.$thread";
+    my $logpath= "$scratch/.build.log";
+    if ($vmtype eq "kvm") {
+        push @args, "--kvm";
+        my $tmpdir_log = "$localrepo/$dist/$arch/logs/$name/";
+        my_distrb_system(mkdir "$tmpdir_log", 0755);
+        $logpath = "$tmpdir_log/.build.log";
+        push @args, "--logfile $logpath";
+    }
+    if ($vmmemory ne "") {
+        push @args, "--vm-memory=$vmmemory";
+    }
+    if ($vmswapsize ne "") {
+        push @args, "--vm-swap-size=$vmswapsize";
+    }
+    if ($vmdisksize ne "") {
+        push @args, "--vm-disk-size=$vmdisksize";
+    }
+    if ($vmdiskfilesystem ne "") {
+        push @args, "--vm-disk-filesystem=$vmdiskfilesystem";
+    }
+    if ($vminitrd ne "") {
+        push @args, "--vm-initrd=$vminitrd";
+    }
+    if ($vmkernel ne "") {
+        push @args, "--vm-kernel=$vmkernel";
+    }
+
+    my $redirect = "";
+    if ($MAX_THREADS > 1 ) {
+        $redirect = "> /dev/null 2>&1";
+    }
+
+    push @args, "--debug" if ($disable_debuginfo != 1);
+    push @args, "--root '$scratch'";
+    if ($noinit == 1 && -e "'$scratch'/not-ready") {
+        error("build root is not ready , --noinit is not allowed");
+    }
+    push @args, "--clean" if (-e "'$scratch'/not-ready");
+    for my $define (@defines) {
+        push @args, "--define '$define'";
+    }
+
+    # push @args, $redirect;
+
+    my $cmd = "";
+    my $builddir;
+    if ($not_ex) {
+        my $base_source = get_source_base_name($to_build{$name}->{source});
+        $builddir = "$scratch/home/abuild/rpmbuild/BUILD/$base_source";
+    } else {
+        $builddir = "$scratch/home/abuild/rpmbuild/BUILD/$name-$version";
+    }
+    my $source_tar = "";
+    if (exists $to_build{$name}->{source}) {
+        $source_tar = "$to_build{$name}->{project_base_path}/$packaging_dir/$to_build{$name}->{source}";
+    }
+    if ($incremental == 1) {
+        info("doing incremental build");
+        @args_inc = @args;
+        my $buildcmd = "";
+        if ( ! -d "$builddir" || grep($_ eq "--clean", @args_inc)){
+            debug("Build directory does not exist");
+            push @args_inc, "--no-build";
+            push @args_inc, "--clean" if (! grep($_ eq "--clean", @args_inc));
+            $cmd = join(" ", @args_inc);
+            return -1 if (my_system($cmd) != 0);
+        } else {
+            debug("build directory exists");
+        }
+
+        # More incremental options
+        if ($run_configure == 1 ) {
+            push @args, "--define '%configure echo'";
+            push @args, "--define '%reconfigure echo'";
+            push @args, "--define '%autogen echo'";
+        }
+        push @args, "--root '$scratch'";
+        push @args, "--no-topdir-cleanup";
+        push @args, "--no-init";
+        @args = grep { $_ ne "--clean"} @args;
+        push @args, "--short-circuit --stage=\"-bs\"";
+
+        my $project_base_path = $to_build{$name}->{project_base_path};
+        if (! -e "$builddir") {
+            my_distrb_system("sudo /bin/mkdir -p '$builddir'");
+        }
+        my $mount = "sudo /bin/mount -o bind '$project_base_path' '$builddir'";
+        my_distrb_system($mount);
+        my $tmp_dir = abs_path(tempdir(CLEANUP=>1));
+        my_distrb_system("tar -zcf '$source_tar' '$tmp_dir'") if ("$source_tar" ne "");
+    }
+
+    if ($not_ex) {
+        if ( -d "$builddir") {
+            my_distrb_system("rm -rf '$builddir'");
+        }
+        my $otherdir = "$scratch/home/abuild/rpmbuild/OTHER/";
+        if ( ! -d "$otherdir") {
+            my_distrb_system("sudo /bin/mkdir -p '$otherdir'");
+        }
+        my $project_base_path = $to_build{$name}->{project_base_path};
+        my_distrb_system("sudo /bin/mkdir -p '$builddir'");
+        my $mount = "sudo /bin/mount -o bind '$project_base_path' '$builddir'";
+        my_distrb_system($mount);
+        my $packaing_files = dirname($to_build{$name}->{filename});
+        my_distrb_system("cp -a $packaing_files/* $project_base_path/");
+        my $tmp_dir = abs_path(tempdir(CLEANUP=>1));
+        my_distrb_system("tar -zcf $source_tar $tmp_dir") if ($source_tar ne "");
+        push @args, "--short-circuit --stage=\"-bs\"";
+        push @args, "--no-topdir-cleanup";
+    } else {
+        push @args, "--stage=\"-bb\"" if ($skip_srcrpm == 1);
+    }
+
+    #must be push the last time
+    push @args, $redirect;
+
+    $cmd = join(" ", @args);
+    debug($cmd);
+    my $ret = my_distrb_system ($cmd);
+    # distrb_safe_umount("$scratch/dev/pts");
+    # distrb_safe_umount("$scratch/dev/shm");
+    # distrb_safe_umount("$scratch/proc");
+    my_distrb_sync_to_system("$scratch/","*.rpm");
+    my_distrb_sync_to_system("$scratch/","*.log");
+
+    if ($incremental == 1) {
+        #FIXME: more safe way needed to remove this fake source tar
+        my_system("rm -f '$source_tar'") if ($source_tar ne "");
+        safe_umount($builddir) if ($incremental == 1);
+    }
+    if ($not_ex) {
+        my_system("rm -f '$source_tar'") if ($source_tar ne "");
+        safe_umount($builddir)
+    }
+
+    # Save build config to build root for --noinit use
+    my_system("sudo /bin/cp '$dist_configs/$dist.conf' '$scratch'/$dist.conf") if ($noinit == 0);
+
+    if ($ret == 0) {
+        # Set the real path of RPMS and SRPMS
+        my $rpmdirpath;
+        my $srcrpmdirpath;
+        # Set the real path of RPMS and SRPMS
+        if ($vmtype eq "kvm") {
+            $rpmdirpath = "/.build.packages/RPMS";
+            $srcrpmdirpath = "/.build.packages/SRPMS";
+        } else {
+            $rpmdirpath = `sudo chroot '$scratch' su -c "rpm --eval %{_rpmdir} 2>/dev/null" - abuild`;
+            $srcrpmdirpath = `sudo chroot '$scratch' su -c "rpm --eval %{_srcrpmdir} 2>/dev/null" - abuild`;
+        }
+        chomp($rpmdirpath);
+        chomp($srcrpmdirpath);
+        mkdir_p "$success_logs_path/$name-$version-$release";
+        if (-e "$logpath") {
+            my_system ("sudo /bin/mv '$logpath' '$success_logs_path'/$name-$version-$release/log.txt");
+            if ($vmtype eq "kvm") {
+                my $dir_logpath = dirname($logpath);
+                my_system ("/bin/rm -rf '$dir_logpath'");
+            }
+            $succeeded{"$name"} = "$success_logs_path/$name-$version-$release/log.txt";
+        }
+        # Detach and terminate
+        {
+            # Update global local repo, so lock it
+            lock($DETACHING);
+	    print POSIX::strftime(update repo "%m/%d/%Y %H:%M:%S\n", localtime);
+#            if (my @srpms = bsd_glob "$scratch/$srcrpmdirpath/*.rpm") {
+            if (my @srpms = (`find "$scratch/$srcrpmdirpath" -type f -name "*.rpm" 2>/dev/null`)) {
+                #remove old srpms in local repo
+                #copy the new ones to local repo
+                update_repo_with_rpms(\%srpmpaths, @srpms);
+                if ($skip_srcrpm == 0){
+                   foreach (@srpms) {
+                       $_ =~ s/\n//; 
+                       my_system ("sudo ln '$_' '$srpm_repo_path'");
+                   }
+                }
+            } elsif ($skip_srcrpm == 1){
+                        my_system("/bin/rm -rf '$srpm_repo_path'/*.rpm");
+            }
+#            if (my @rpms = bsd_glob "$scratch/$rpmdirpath/*/*.rpm") {
+            if (my @rpms = (`find "$scratch/$rpmdirpath" -type f -name "*.rpm" 2>/dev/null`)) {
+                #remove old rpms in local repo
+                #remove old rpms in local repo
+                #copy the new ones to local repo
+                update_repo_with_rpms (\%rpmpaths, @rpms);
+                foreach (@rpms) {
+                    $_ =~ s/\n//;
+                    my_system ("sudo ln '$_' '$rpm_repo_path'");
+                }
+            }
+            print POSIX::strftime("createdirdeps start %m/%d/%Y %H:%M:%S\n", localtime);
+            my_system("'$build_dir'/createdirdeps '$rpm_repo_path' > '$order_dir'/.repo.cache.local ");
+            my_system("echo D: >> '$order_dir'/.repo.cache.local");
+            my_system("cat '$order_dir'/.repo.cache.local '$order_dir'/.repo.cache.remote >'$order_dir'/.repo.cache");
+	    print POSIX::strftime("createdirdeps end %m/%d/%Y %H:%M:%S\n", localtime);
+        }
+        info("finished remote building $name");
+        $packages_built = 1;
+        return 0;
+    } else {
+        mkdir_p "$fail_logs_path/$name-$version-$release";
+        if ( -f "$logpath" ) {
+            # move failed log from build root
+            my_system ("sudo /bin/mv '$logpath' '$fail_logs_path'/$name-$version-$release/log.txt");
+            if ($vmtype eq "kvm") {
+                my $dir_logpath = dirname($logpath);
+                my_system ("/bin/rm -rf '$dir_logpath'");
+            }
+            $errors{"$name"} = "$fail_logs_path/$name-$version-$release/log.txt";
+            warning("build failed, Leaving the logs in $fail_logs_path/$name-$version-$release/log.txt");
+        } else {
+            $errors{"$name"} = "";
+        }
+        return 1;
+    }
+
 
 }
 
@@ -3017,6 +3542,9 @@ if ($preordered_list ne "") {
     }
 }
 
+# if distrb build
+my_distrb_init() if ($distrb_build);
+
 # Main process loop
 # Every loop, first update package information
 # include dependencies if there is new package
@@ -3039,6 +3567,8 @@ while (! $TERM) {
             create_cache_local();
             refresh_repo();
             update_expansion_errors();
+	    my_system_sync_to_distrb("$localrepo/") if ($distrb_build);
+
             #update_pkgdeps();
             #update_pkgddeps();
             #if (check_circle() == 1) {
@@ -3143,7 +3673,47 @@ while (! $TERM) {
 				last ;
 	    	}
 
-            my $worker = find_idle();
+            #my $worker = find_idle();
+	    my $worker;
+
+	    # if distrbute build 
+            if ($distrb_build) {
+	       my @pkgs_list = split(",", $distrb_pkgs);
+	       my $find = 0;
+               if( grep($_ eq $job, @chromium_efl_build_order) ) {
+                    $find = 0;
+               } else {
+                 foreach my $name (@chromium_efl_build_order) {
+                   if( ! (grep $_ eq $name, @done) )
+                   {
+                     $find = 1;
+                     last;  
+                   }
+		   $find = 0;
+                 }
+               }
+	       if ( grep($_ eq $job, @pkgs_list) || grep($_ eq $job, @zero_links) ) {
+                   $find = 1;
+	       }
+
+               if ($find == 1) {
+                  $worker = find_idle_next(int(int($MAX_THREADS)-int($distrb_threads)));
+		  if ($worker == -1) {
+		      next;
+	          }
+               } else {
+                  $worker = find_idle();
+               }
+	       # print "clean: $clean_from_pkg , $job \n";
+	       if ($clean_from_pkg eq $job) {
+		  print "cleaned\n";
+                  @cleaned = ();
+		  @zero_links = ();
+	       }
+	    } else {
+	       $worker = find_idle();
+            }
+
             my $index;
             {
                 # @done and @running are thread shared vars
@@ -3164,6 +3734,10 @@ while (! $TERM) {
 while ((threads->list() > 0)) {
     sleep(1);
 }
+
+# if distrbute build 
+my_distrb_remove() if ($distrb_build);
+
 update_repo();
 build_report();
 
