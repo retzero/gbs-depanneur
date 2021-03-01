@@ -1,0 +1,741 @@
+#!/usr/bin/env python
+# vim: ai ts=4 sts=4 et sw=4
+#
+# Copyright (c) 2011 Intel, Inc.
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation; version 2 of the License
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+# for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc., 59
+# Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+
+"""Gbs - commandline tool for Tizen developers. Main module."""
+
+import sys
+import os
+
+from argparse import ArgumentParser
+
+from gitbuildsys import __version__
+from gitbuildsys import errors
+from gitbuildsys.parsing import subparser, GbsHelpFormatter, basename_type
+from gitbuildsys import log
+
+from gitbuildsys.utils import SearchConfAction
+
+SUPPORTED_ARCHS = ['x86_64','i586','armv6l','armv7hl','armv7l','aarch64','mips','mipsel',]
+
+
+@subparser
+def import_parser(parser):
+    """import spec file/source rpm/tar ball to git repository
+    Examples:
+      $ gbs import /path/to/specfile.spec
+      $ gbs import /path/to/package-version.src.rpm
+      $ gbs import /path/to/tarball.tar.gz
+    """
+
+    parser.add_argument('path', type=os.path.abspath,
+                        help='path to spec, srcrpm or tarball')
+
+    parser.add_argument('--author-name', help='author name of git commit')
+    parser.add_argument('--author-email', help='author email of git commit')
+    parser.add_argument('--upstream-branch',
+                        help='specify upstream branch for new package version')
+    parser.add_argument('--upstream-tag',
+                        help="upstream tag format, '${upstreamversion}' is "
+                        'expanded to the version in the spec file. '
+                        "E.g. 'v${upstreamversion}'")
+    parser.add_argument('--upstream-vcs-tag',
+                        help='upstream VCS tag on top of which to import the '
+                             'orig sources')
+    parser.add_argument('--packaging-dir',
+                        help='directory containing packaging files')
+    parser.add_argument('--no-pristine-tar', action='store_true',
+                         help='don\'t use pristine-tar to import source. '
+                        'pristine-tar only support import *tar.{gz,bz2,xz} '
+                        'sources, this option can be specified to import '
+                        'other format sources')
+    parser.add_argument('--filter', action="append",
+                        help='files to filter out during import(can be given '
+                        'multiple times)')
+    group = parser.add_argument_group('only for importing srpms and spec file '
+                        'options')
+    group.add_argument('--allow-same-version', action='store_true',
+                         help='allow to import already imported version')
+    group.add_argument('--native', action='store_true',
+                       help='this is a dist native package, no separate '
+                       'upstream')
+    group.add_argument('--orphan-packaging', action='store_true',
+                       help='create a git layout for separate packaging and '
+                            'development branches (only for non-native '
+                            'packages)')
+    group.add_argument('--no-patch-import', action='store_true',
+                       help='don\'t import patches automatically')
+    group = parser.add_argument_group('only for importing upstream tar ball '
+                        'options')
+    group.add_argument('--merge', action='store_true',
+                         help='merge new upstream branch to master')
+
+    parser.set_defaults(alias="im")
+    return parser
+
+@subparser
+def export_parser(parser):
+    """export files and prepare for build
+    Examples:
+      $ gbs export --spec my.spec --commit d64065c
+      $ gbs export --source-rpm -o /tmp/
+      $ gbs export --include-all
+    """
+
+    parser.add_argument('gitdir', nargs='?', type=os.path.abspath,
+                        default=os.getcwd(),
+                        action=SearchConfAction,
+                        help='path to git repository')
+
+    parser.add_argument('-o', '--outdir', help='output directory')
+    parser.add_argument('--spec', type=basename_type,
+                        help='specify a spec file to use. It should be a file '
+                        'name that GBS will find it in packaging dir')
+    parser.add_argument('-c', '--commit', help='specify a commit ID to export')
+    parser.add_argument('--include-all', action='store_true',
+                        help='uncommitted changes and untracked files '
+                        'would be included while generating tar ball')
+    parser.add_argument('--fallback-to-native', action='store_true',
+                        default=None,
+                        help='Fall back to native packaging mode (i.e. create '
+                        'tarball directly from exported commit, not from '
+                        'upstream tag, and without patches) in case patch '
+                        'or upstream tarball generation fails.')
+    parser.add_argument('--source-rpm', action='store_true',
+                        help='generate source rpm')
+    parser.add_argument('--no-patch-export', action='store_true',
+                        help='don\'t create patches between upstream and '
+                        'export-treeish, and create tar ball from the '
+                        'export-treeish instead of upstream branch')
+    parser.add_argument('--upstream-branch', help='upstream branch')
+    parser.add_argument('--upstream-tag',
+                        help="upstream tag format, '${upstreamversion}' is "
+                        'expanded to the version in the spec file. '
+                        "E.g. 'v${upstreamversion}'")
+    parser.add_argument('--squash-patches-until',
+                         help='when generating patches, squash patches up '
+                         'to given commit-ish into one monolithic diff file. '
+                         'Format is the commit-ish optionally followed by a '
+                         'colon and diff filename base.')
+    parser.add_argument('--packaging-dir',
+                        help='directory containing packaging files')
+    parser.add_argument('--outdir-directly', action='store_true',
+                        help='Use the directory of --outdir parameter directly'
+                        'rather than outdir/pkg-version-release')
+
+    parser.set_defaults(alias="ex")
+    return parser
+
+@subparser
+def build_parser(parser):
+    """local build package
+    Examples:
+      $ gbs build -A i586   # build all packages under current dir for i586
+      $ gbs build -A armv7l # build all packages under current dir for armv7l
+      $ gbs build -A i586 --overwrite   # rebuild the packages
+      $ gbs build -A i586 --include-all # build packages including un-commit changes
+      $ gbs build -A i586 --incremental # incremental build
+      $ gbs build -A i586 --noinit      # build with offline mode
+      $ gbs build -A i586 --clean       # clean build by deleting the old build root
+      $ gbs build -A i586 <gitdir>      # build all packages under <gitdir>
+
+    """
+
+    parser.add_argument('gitdir', nargs='?', type=os.path.abspath,
+                        default=os.getcwd(),
+                        action=SearchConfAction,
+                        help='git repository path, which can contain multiple '
+                        'packages, in this case, all packages will be built in '
+                        'dependency order')
+
+    group = parser.add_argument_group('build configuration options')
+    group.add_argument('-A', '--arch', help='build target arch. Supported arch '
+                       'types are: %s' % ' '.join(SUPPORTED_ARCHS))
+    group.add_argument('-D', '--dist',
+                        help='specify project (build) configuration file. '
+                        'User can specify build config in [profile.xx] '
+                        'section of gbs.conf using \'buildconf\' key, and '
+                        'the value is local path of build conf file')
+    group.add_argument('-P', '--profile',
+                        help='profile to be used for building, it is defined '
+                             'in .gbs.conf, can be given without the '
+                             '"profile." prefix')
+    group.add_argument('-R', '--repository', dest='repositories',
+                        action="append", help='specify package repositories, '
+                        'only rpm-md format is supported')
+    group.add_argument('--skip-conf-repos', action="store_true",
+                        help='skip repositories mentioned in config file, '
+                        'and only use repos from command line -R option')
+    group.add_argument('--overwrite', action='store_true',
+                        help='overwrite existing binaries and build '
+                        'them anyway')
+    group.add_argument('--define', action="append",
+                        help='define macro X with value Y with format "X Y"')
+    group.add_argument('--debug', action='store_true', help='debug output')
+    group.add_argument('--baselibs', action='store_true', help='create -32bit'
+                       '/-64bit/-x86 rpms for other architectures')
+
+    group = parser.add_argument_group('build env options')
+    group.add_argument('-B', '--buildroot',
+                        help='specify build root to setup chroot environment. '
+                        'By default, ~/GBS-ROOT/ will be used. User can specify'
+                        ' customized build root in gbs.conf with \'buildroot\' '
+                        'key, which can be set in [general] section for default'
+                        ' build root, or in [profile.xx] section for profile '
+                        'special build root')
+    group.add_argument('-C', '--clean', action='store_true',
+                        help='delete old build root before initialization')
+    group.add_argument('--clean-once', action='store_true',
+                        help='clean the build environment only once when you '
+                        'start building multiple packages, after that use '
+                        'existing environment for all packages.')
+    group.add_argument('--clean-repos', action='store_true',
+                        help='clean up local repos created by gbs build '
+                        'before building packages')
+    group.add_argument('--fail-fast', action='store_true',
+                        help='stop build if one of packages fails')
+    group.add_argument('--keepgoing',
+                        help='If a package build fails, do not abort and continue'
+                        'building other packages in the queue')
+    group.add_argument('--extra-packs',
+                        help='specify extra packages to install to build root, '
+                        'Multiple packages can be separated by comma(,)')
+    group.add_argument('--keep-packs', action='store_true',
+                        help='keep unused packages in build root. without '
+                        'this option, unused packages will be removed from '
+                        'build root')
+    group.add_argument('--use-higher-deps', action='store_true',
+                        help='Which repo provides higher version deps, use it')
+    group.add_argument('--kvm', action='store_true',
+                        help='Launch a kvm machine to build package instead of using chroot')
+    group.add_argument('--vm-memory', type=int, default=4096,
+                        help='The memory size of kvm machine')
+    group.add_argument('--vm-disk', type=int, default=32768,
+                        help='The disk size of kvm machine')
+    group.add_argument('--vm-swap', type=int, default=8192,
+                        help='The swap size of kvm machine')
+    group.add_argument('--vm-diskfilesystem', type=str, default='ext4',
+                        help='The filesystem type of kvm machine')
+    group.add_argument('--vm-initrd', type=str, default='/usr/share/gbs/initrd',
+                        help='The initrd of kvm machine')
+    group.add_argument('--vm-kernel', type=str, default='/usr/share/gbs/vmlinuz',
+                        help='The kernel of kvm machine')
+    group.add_argument('--not-export-source', action='store_true',
+                        help='Do not export source, use git source to build directly')
+    group.add_argument('--full-build', action='store_true',
+                        help='Download all the package sources except local package in gbs.conf, and do build')
+    group.add_argument('--deps-build', action='store_true',
+                        help='Download packages depends on local package from gbs.conf, and do build')
+    group.add_argument('--snapshot', type=str, help='Specify snapshot id to use')
+
+    group = parser.add_argument_group('speed up building options')
+    group.add_argument('--incremental', action='store_true',
+                       help='build a package from the local git tree '
+                        'incremental. If the build fails, changes can be done '
+                        'directly to the source and build can continue from '
+                        'where it stopped')
+    group.add_argument('--no-configure', action='store_true',
+                        help='this option disables running configure scripts '
+                        'and auto generation of auto-tools to make incremental '
+                        'build possible. This requires the configure scripts '
+                        'in the spec to be referenced using the %%configure, '
+                        '%%reconfigure and %%autogen macros')
+    group.add_argument('--noinit', action='store_true',
+                        help='working in offline mode. Start building directly')
+    group.add_argument('--ccache', action="store_true",
+                        help='use ccache to speed up rebuilds')
+    group.add_argument('--icecream', type=int, default=0,
+                        help='Use N parallel build jobs with icecream')
+    group.add_argument('--threads', type=int, default=1,
+                        help='number of threads to build multiple packages '
+                        'in parallel')
+    group.add_argument('--skip-srcrpm', action='store_true',
+                        help='don\'t build source rpm file')
+
+
+    group = parser.add_argument_group('git-tree options')
+    group.add_argument('-c', '--commit', help='specify a commit ID to build')
+    group.add_argument('--include-all', action='store_true',
+                        help='uncommitted changes and untracked files would be '
+                        'included while generating tar ball')
+    group.add_argument('--packaging-dir',
+                        help='directory containing packaging files')
+    group.add_argument('--spec', type=basename_type,
+                        help='specify a spec file to use. It should be a file '
+                        'name that GBS will find it in packaging dir')
+    group.add_argument('--upstream-branch', help='upstream branch')
+    group.add_argument('--upstream-tag',
+                        help="upstream tag format, '${upstreamversion}' is "
+                        "expanded to the version in the spec file. "
+                        "E.g. 'v${upstreamversion}'")
+    group.add_argument('--fallback-to-native', action='store_true',
+                       default=None,
+                       help='Fall back to native packaging mode (i.e. create '
+                       'tarball directly from exported commit, not from '
+                       'upstream tag, and without patches) in case patch '
+                       'or upstream tarball generation fails.')
+    group.add_argument('--squash-patches-until',
+                        help='when generating patches, squash patches up '
+                        'to given commit-ish into one monolithic diff file. '
+                        'Format is the commit-ish optionally followed by a '
+                        'colon and diff filename base.')
+    group.add_argument('--no-patch-export', action='store_true',
+                        help='don\'t create patches between upstream and '
+                        'export-treeish, and create tar ball from the '
+                        'export-treeish instead of upstream branch')
+
+    group = parser.add_argument_group('package selection options')
+    group.add_argument('--package-list', default='',
+                       help='specify a package list to be built. Multiple '
+                       'packages can be separated by comma(,). Note: packages '
+                       'are package dir name')
+    group.add_argument('--package-from-file',
+                        help='specify a package list file. Packages '
+                       'listed in this file will be selected to be built. '
+                       'The format of file is one package dir for one '
+                       'line')
+    group.add_argument('--binary-list', default='',
+                       help='specify a package list to be built. Multiple '
+                       'packages can be separated by comma(,). Note: package '
+                       'names are from spec files, not the package dir name')
+    group.add_argument('--binary-from-file',
+                        help='specify a binary package list file. Packages '
+                       'listed in this file will be selected to be built. '
+                       'The format of binary-list file is one package for one '
+                       'line, and only binary RPM name is accepted')
+    group.add_argument('--exclude',
+                        help='specify a package list to be excluded for '
+                        'building. Multiple packages can be separated by '
+                        'comma(,)')
+    group.add_argument('--exclude-from-file',
+                        help='specify an exclude package list text file, the '
+                        'format is one package in one line, and only binary '
+                        'RPM package name is accepted. Packages listed in '
+                        'this file will be skipped to be built.')
+    group.add_argument('--deps', action='store_true',
+                        help='build specified packages and all packages '
+                        'they depend on, such as A depends B,C,D, first build B,C,D and then build A')
+    group.add_argument('--rdeps', action='store_true',
+                        help='build specified packages and all packages '
+                        'depend on them, such as A B C depends D, first build D and then build A,B,C')
+    group.add_argument('--disable-debuginfo', action='store_true',
+                        help='Do not create debuginfo packages when building')
+    group.add_argument('--style', default='git',
+                        help='specify source type: git, or tar, default is git')
+    group.add_argument('--export-only', action='store_true',
+                        help='only export, not building')
+    group.add_argument('--preordered-list', default='',
+                        help='Provide comma(,) separated list of ordered packages '
+                        'to support user defined build order calculation.')
+
+    parser.set_defaults(alias="lb")
+    return parser
+
+@subparser
+def createimage_parser(parser):
+    """create image using ks file
+    Examples:
+      $ gbs createimage --ks-file=path/to/ks-file
+      $ gbs createimage --ks-file=path/to/ks-file --tmpfs
+    """
+    parser.add_argument('-K', '--ks-file', required=True,
+                        help='ks file to be used for image creation')
+    parser.add_argument('-O', '--outdir',
+                        help='image output directory')
+    parser.add_argument('--tmpfs', action='store_true',
+                        help='use tmpfs to accelerate creating image, but '\
+                             'plesae make sure you have enough free memory '\
+                             'for whole image')
+    parser.set_defaults(alias="cr")
+    return parser
+
+@subparser
+def remotebuild_parser(parser):
+    """remote build package
+    Examples:
+      $ gbs remotebuild
+      $ gbs remotebuild -B Test
+      $ gbs remotebuild -B Test -T home:<userid>:gbs
+      $ gbs remotebuild <package git directory>
+    """
+
+    parser.add_argument('gitdir', nargs='?', type=os.path.abspath,
+                        default=os.getcwd(),
+                        action=SearchConfAction,
+                        help='path to git repository')
+
+    parser.add_argument('-T', '--target-obsprj',
+                        help='OBS project where package will be checked in. '
+                        'Default is home:<userid>:gbs:<base_prj>, you can '
+                        'set default target_prj in .gbs.conf')
+    parser.add_argument('-B', '--base-obsprj',
+                        help='OBS project being used to branch from, you can '
+                        'set default base_prj in .gbs.conf')
+    parser.add_argument('-P', '--profile',
+                        help='profile to be used for building, can be given '
+                             'without the "profile." prefix')
+    parser.add_argument('--spec', type=basename_type,
+                        help='specify a spec file to use. It should be a file '
+                        'name that GBS will find it in packaging dir')
+    parser.add_argument('-c', '--commit', help='specify a commit ID to build')
+    parser.add_argument('--no-patch-export', action='store_true',
+                        help='don\'t create patches between upstream and '
+                        'export-treeish, and create tar ball from the '
+                        'export-treeish instead of upstream branch')
+    parser.add_argument('--buildlog', action='store_true',
+                        help='get buildlog from build sever')
+    parser.add_argument('--status', action='store_true',
+                        help='get build status from build server')
+    parser.add_argument('-R', '--repository',
+                        help='OBS repository for --buildlog')
+    parser.add_argument('-A', '--arch',
+                        help='OBS build architecture for --buildlog')
+    parser.add_argument('--include-all', action='store_true',
+                        help='uncommitted changes and untracked files will be '
+                        'included while generating tar ball')
+    parser.add_argument('--fallback-to-native', action='store_true',
+                        default=None,
+                        help='Fall back to native packaging mode (i.e. create '
+                        'tarball directly from exported commit, not from '
+                        'upstream tag, and without patches) in case patch '
+                        'or upstream tarball generation fails.')
+    parser.add_argument('--upstream-branch', help='upstream branch')
+    parser.add_argument('--upstream-tag',
+                        help="upstream tag format, '${upstreamversion}' is "
+                        "expanded to the version in the spec file. "
+                        "E.g. 'v${upstreamversion}'")
+    parser.add_argument('--squash-patches-until',
+                        help='when generating patches, squash patches up to '
+                        'given commit-ish into one monolithic diff file. '
+                        'Format is the commit-ish optionally followed by a '
+                        'colon and diff filename base.')
+    parser.add_argument('--packaging-dir',
+                        help='directory containing packaging files')
+
+    parser.set_defaults(alias="rb")
+    return parser
+
+@subparser
+def chroot_parser(parser):
+    """chroot to build root
+    Examples:
+      $ gbs chroot /var/tmp/mybuildroot
+      $ gbs chroot --root /var/tmp/mybuildroot
+
+    Note: The default location of build root located at:
+    ~/GBS-ROOT/local/scratch.{arch}.*, which will be different
+    if -B option specified while running gbs build
+    """
+
+    parser.add_argument('buildroot', type=os.path.abspath,
+                        help='path to build root')
+
+    parser.add_argument('-r', '--root', action='store_true',
+                        help='chroot as root instead of abuild by default')
+
+    parser.set_defaults(alias="chr")
+    return parser
+
+@subparser
+def changelog_parser(parser):
+    """update the changelog file with the git commit messages
+    Examples:
+      $ gbs changelog
+      $ gbs changelog --since=COMMIT_ID
+      $ gbs changelog -m 'new upstream release 0.0.1'
+    """
+
+    parser.add_argument('gitdir', nargs='?', type=os.path.abspath,
+                        default=os.getcwd(),
+                        action=SearchConfAction,
+                        help='path to git repository')
+
+    parser.add_argument('--spec', type=basename_type,
+                        help='specify a spec file to use. It should be a file '
+                        'name that GBS will find it in packaging dir')
+    parser.add_argument('-s', '--since',
+                        help='commit to start from')
+    parser.add_argument('-a', '--all', action='store_true',
+                        help='use all commits from history')
+    parser.add_argument('-m', '--message',
+                        help='use given message as the changelog entry')
+    parser.add_argument('--packaging-dir',
+                        help='directory containing packaging files')
+    parser.set_defaults(alias='ch')
+    return parser
+
+@subparser
+def submit_parser(parser):
+    """submit tag to gerrit and trigger building in OBS
+    Examples:
+      $ gbs submit -m 'release for 0.1'
+      $ gbs submit -c <commit_ID> -m 'release for 0.2'
+      $ gbs submit -m 'release for 0.3' -s
+      $ gbs submit -r ssh://user@review.tizen.org:29418/public/base/gcc -m 'release for 0.4'
+    """
+
+    parser.add_argument('gitdir', nargs='?', type=os.path.abspath,
+                        default=os.getcwd(),
+                        action=SearchConfAction,
+                        help='path to git repository')
+
+    parser.add_argument('--tag', help='create tag using specified tag name. '
+                        'This option can be used for group submission, and '
+                        'submissions with same tag can be seen as one group')
+    parser.add_argument('-m', '--msg', help='specify tag message info')
+    parser.add_argument('-c', '--commit', default='HEAD',
+                        help='specify a commit ID to submit')
+    parser.add_argument('-s', '--sign', action='store_true',
+                        help='make a GPG-signed tag')
+    parser.add_argument('-u', '--user-key',
+                        help='using the given key to make a GPG-signed tag')
+    parser.add_argument('-t', '--target',
+                        help='specify target version to submit, eg: trunk.')
+    parser.add_argument('-r', '--remote',
+                        help='specify gerrit project server, '
+                        'for example:\nssh://user@review.tizen.org:29418'
+                        '/public/base/gcc')
+
+    parser.set_defaults(alias="sr")
+    return parser
+
+@subparser
+def clone_parser(parser):
+    """Clone a git repository
+    Examples:
+      $ gbs clone git://example.com/repos/package.git
+      $ gbs clone git://example.com/repos/package.git dir
+      $ gbs clone --upstream-branch=orig ../package.git
+    """
+
+    parser.add_argument('uri', help='path/uri to a git repository')
+    parser.add_argument('directory', nargs='?', help='the name of a new directory to clone into. '
+                        'Cloning into an existing directory is only allowed if the directory is empty.')
+    parser.add_argument('--upstream-branch', help='upstream branch')
+    parser.add_argument('--packaging-branch', help='packaging branch, or development branch')
+    parser.add_argument('--all', action='store_true',
+                        help='track all remote branches')
+    parser.add_argument('--depth',
+                        help='git history depth, for creating shallow clones')
+    parser.set_defaults(alias="cl")
+    return parser
+
+@subparser
+def pull_parser(parser):
+    """Update a package git repository
+    Examples:
+      $ gbs pull
+      $ gbs pull --upstream-branch=orig
+    """
+
+    parser.add_argument('--upstream-branch', help='upstream branch')
+    parser.add_argument('--depth',
+                        help='git history depth, for creating shallow clones')
+    parser.add_argument('--force', action='store_true',
+                        help='force branch update even if unable to '
+                            'fast-forward, WARNING: local changes may be lost')
+    parser.add_argument('--all', action='store_true',
+                        help='update all branches')
+    return parser
+
+@subparser
+def devel_parser(parser):
+    """Manage devel branches
+    Examples:
+      $ gbs devel start
+      $ gbs devel export
+    """
+
+    parser.add_argument('gitdir', nargs='?', type=os.path.abspath,
+                        default=os.getcwd(),
+                        action=SearchConfAction,
+                        help='path to git repository')
+    parser.add_argument('--packaging-dir',
+                        help='directory containing packaging files')
+    parser.add_argument('--spec', type=basename_type,
+                        help='specify a spec file to use. It should be a file '
+                        'name that GBS will find it in packaging dir')
+    parser.add_argument('--upstream-tag',
+                        help="upstream tag format, '${upstreamversion}' is "
+                        'expanded to the version in the spec file. '
+                        "E.g. 'v${upstreamversion}'")
+    parser.add_argument('--retain-history', action='store_true',
+                        help='Preserve as much of the git history as possible '
+                        'in the conversion, i.e. create one commit per commit. '
+                        'Only relevant for the convert action.')
+    parser.add_argument('action', choices=['start', 'export', 'drop', 'switch',
+                        'convert'],
+                        help='Action to take')
+    return parser
+
+@subparser
+def depends_parser(parser):
+    """Output reverse depends of packages
+    Examples:
+      $ gbs depends -A i586   # generate reverse depends of packages for i586
+    """
+
+    parser.add_argument('gitdir', nargs='?', type=os.path.abspath,
+                        default=os.getcwd(),
+                        action=SearchConfAction,
+                        help='git repository path, which can contain multiple '
+                        'packages, in this case, all packages will be analysed in '
+                        'dependency order')
+
+    group = parser.add_argument_group('depends configuration options')
+    group.add_argument('-A', '--arch', help='target arch. Supported arch '
+                       'types are: %s' % ' '.join(SUPPORTED_ARCHS))
+    group.add_argument('-D', '--dist',
+                        help='specify project (build) configuration file. '
+                        'User can specify build config in [profile.xx] '
+                        'section of gbs.conf using \'buildconf\' key, and '
+                        'the value is local path of build conf file')
+    group.add_argument('-P', '--profile',
+                        help='profile to be used for building, it is defined '
+                             'in .gbs.conf, can be given without the '
+                             '"profile." prefix')
+    group.add_argument('-R', '--repository', dest='repositories',
+                        action="append", help='specify package repositories, '
+                        'only rpm-md format is supported')
+    group.add_argument('--debug', action='store_true', help='debug output')
+    group.add_argument('-o', '--output',
+                        help='specify output directory for reverse depends files')
+    group.add_argument('--tarfile', action='store_true',
+                        help='generate the tar file for xml file')
+
+    group = parser.add_argument_group('depends env options')
+    group.add_argument('-B', '--buildroot',
+                        help='specify build root to setup chroot environment. '
+                        'By default, ~/GBS-ROOT/ will be used. User can specify'
+                        ' customized build root in gbs.conf with \'buildroot\' '
+                        'key, which can be set in [general] section for default'
+                        ' build root, or in [profile.xx] section for profile '
+                        'special build root')
+
+    group = parser.add_argument_group('git-tree options')
+    group.add_argument('-c', '--commit', help='specify a commit ID to build')
+    group.add_argument('--include-all', action='store_true',
+                        help='uncommitted changes and untracked files would be '
+                        'included while generating tar ball')
+    group.add_argument('--packaging-dir',
+                        help='directory containing packaging files')
+    group.add_argument('--style', default='git',
+                        help='specify source type: git, or tar, default is git')
+    group.add_argument('--local-only', action='store_true',
+                        help='generate depends only from local repo rpms')
+
+    return parser
+
+def main(argv):
+    """Script entry point."""
+
+    def has_parameter(arg, arglist):
+        """
+        Helper function.
+        Check if argument requires parameter by analyzing
+        its action. Parameter is required only for 'store' and 'append' actions
+        """
+        if arg.startswith('-'):
+            for args in arglist:
+                if arg in (args['short'], args['long']):
+                    if args.get('action') in (None, 'store', 'append'):
+                        return True
+                    return False
+
+    # Create top level parser
+    epilog = "Try 'gbs SUBCOMMAND --help' for help on a specific subcommand."
+    description = "gbs - the command line tool for Tizen package developers"
+    parser = ArgumentParser(description=description, epilog=epilog,
+                            formatter_class=GbsHelpFormatter)
+
+    # List of global arguments
+    # The main purpose of this structure is to contain arguments
+    # of add_argument. This is used to do aliasing properly
+    # (see code under the comment 'replace aliases with real commands')
+    global_args = [{'short': '-V', 'long': '--version', 'action': 'version',
+                    'version': '%(prog)s ' + __version__},
+                   {'short': '-c', 'long': '--conf',
+                    'help': 'specify config file for gbs'},
+                   {'short': '-d', 'long': '--debug', 'action': 'store_true',
+                    'help': 'debug output'},
+                   {'short': '-v', 'long': '--verbose', 'action': 'store_true',
+                    'help': 'verbose output'}]
+
+    for args in global_args:
+        parser_kwargs = {}
+        for key in ('action', 'help', 'version'):
+            if key in args:
+                parser_kwargs[key] = args[key]
+
+        parser.add_argument(args['short'], args['long'], **parser_kwargs)
+
+    # hacked by the request of cmdln lovers
+    parser.format_usage = parser.format_help
+
+    # Create parsers for subcommands
+    subparsers = parser.add_subparsers(title='subcommands')
+
+    # collect aliases
+    aliases = {}
+    for name, obj in globals().iteritems():
+        if name.endswith('_parser') and callable(obj):
+            aliases[obj(subparsers).get_default('alias')] = name.split('_')[0]
+
+    # replace aliases with real commands
+    for i, arg in enumerate(argv[1:]):
+        if not arg.startswith('-'):
+            # argv[i] is previous argument to arg
+            if not has_parameter(argv[i], global_args) and arg in aliases:
+                argv[i+1] = aliases[arg]
+                break
+
+    # Parse arguments
+    args = parser.parse_args(argv[1:])
+
+    log.setup(verbose=args.verbose, debug=args.debug)
+
+    # Process configuration file if --conf is used
+    if args.conf:
+        from gitbuildsys.conf import configmgr
+        configmgr.add_conf(args.conf)
+
+    # Import target module and call 'main' from it
+    module = __import__("gitbuildsys.%s" % args.module, fromlist=[args.module])
+    return module.main(args)
+
+
+if __name__ == '__main__':
+    log.setup(verbose=False)
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        log.LOGGER.error('^C caught, program aborted.')
+
+    except errors.Usage as usage:
+        log.LOGGER.error(str(usage))
+
+    except errors.CmdError as err:
+        if log.LOGGER.level == log.DEBUG:
+            import traceback
+            log.LOGGER.error(traceback.format_exc())
+        else:
+            log.LOGGER.error(str(err))
+
+    except Exception:
+        import traceback
+        log.LOGGER.error(traceback.format_exc())
+    sys.exit(1)
